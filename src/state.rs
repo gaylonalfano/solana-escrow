@@ -127,7 +127,5 @@ impl Pack for Escrow {
         temp_token_account_pubkey_dst.copy_from_slice(temp_token_account_pubkey.as_ref());
         initializer_token_to_receive_account_pubkey_dst.copy_from_slice(initializer_token_to_receive_account_pubkey.as_ref());
         *expected_amount_dst = expected_amount.to_le_bytes();
-
-
     }
 }

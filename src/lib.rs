@@ -1,5 +1,7 @@
-pub mod instruction;
+// NOTE MUST register our mods/crates here or won't compile!
 pub mod error;
+pub mod instruction;
+pub mod processor;
 pub mod state;
 
 

@@ -2,13 +2,15 @@
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
-    program_error::ProgramError,
     msg,
-    pubkey::Pubkey,
+    program::invoke,
+    program_error::ProgramError,
     program_pack::{Pack, IsInitialized},
+    pubkey::Pubkey,
     sysvar::{rent::Rent, Sysvar},
-    program::invoke
 };
+
+// use spl_token::state::Account as TokenAccount;
 
 // NOTE use crate -> refers to our local modules (crates?) we've made
 // All crates must be registered inside Cargo.toml
@@ -87,11 +89,14 @@ impl Processor {
         // transaction would fail because the Token Program will attempt to send the Y tokens
         // to Alice but not be the owner of the token_to_receive_account. That said, it seems
         // more reasonable explicitly specify which transaction failed/led to the invalid state.
-        // NOTE spl_token is a crate
+        // NOTE spl_token is a crate and it's aka the token program
         if *token_to_receive_account.owner != spl_token::id() {
             // NOTE '*' means the ACTUAL value, NOT a reference. * is for de-referencing.
             return Err(ProgramError::IncorrectProgramId);
         }
+        // TODO Check that token_to_receive_account is a TOKEN account, NOT a 
+        // token MINT account!
+        // if *token_to_receive_account.type != spl_token::
 
         let escrow_account = next_account_info(account_info_iter)?;
         let rent = &Rent::from_account_info(next_account_info(account_info_iter)?)?;
@@ -99,7 +104,7 @@ impl Processor {
         // NOTE Most times you want your accounts to be rent-exempt, because if
         // balances go to zero, they DISAPPEAR!
         if !rent.is_exempt(escrow_account.lamports(), escrow_account.data_len()) {
-            return Err(EscrowError::NotRentExempt.info());
+            return Err(EscrowError::NotRentExempt.into());
         }
 
         // NOTE First time we access the account data ([u8]). We deserialize/decode it with
@@ -132,8 +137,8 @@ impl Processor {
         // token accounts for different escrows occurring at any and possibly the same point
         // in time.
         // NOTE A PDA are public keys that are derived from the program_id and the seeds as
-        // well as having been pushed off the ed25519 standard eliptic curve by the bump seed!
-        // (Solana key pairs use the ed25519 standard.)
+        // well as having been pushed off the ed25519 standard eliptic curve by the 
+        // bump seed (nonce)! (Solana key pairs use the ed25519 standard.)
         // Hence, PDAs do not lie on the ed25519 curve and therefore have no private keys
         // associated with them! A PDA is just a random array of bytes with the only defining
         // feature being that they are NOT on that curve. We'll later use the bump seed when
