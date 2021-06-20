@@ -34,7 +34,7 @@ pub struct Escrow {
     // program's responsibility to check that received_accounts == expected_accounts.
     pub temp_token_account_pubkey: Pubkey,
     // Save initializer_token_to_receive_account_pubkey so that when Bob takes the trade,
-    // his tokens can be sent to this account.
+    // his tokens can be sent to this account (i.e., Alice's Y token account).
     pub initializer_token_to_receive_account_pubkey: Pubkey,
     // Save expected_amount so we can use it to check that Bob sends enough tokens.
     pub expected_amount: u64,

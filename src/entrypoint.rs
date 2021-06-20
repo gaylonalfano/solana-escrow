@@ -8,7 +8,7 @@ use crate::processor::Processor;
 
 entrypoint!(process_instruction);
 fn process_instruction(
-    program_id: &Pubkey,
+    program_id: &Pubkey, // Id returned from: solana deploy
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
