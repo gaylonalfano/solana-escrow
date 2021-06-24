@@ -3,14 +3,15 @@ use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
     msg,
-    program::invoke,
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
     program_pack::{Pack, IsInitialized},
     pubkey::Pubkey,
     sysvar::{rent::Rent, Sysvar},
 };
 
-// use spl_token::state::Account as TokenAccount;
+
+use spl_token::state::Account as TokenAccount;
 
 // NOTE use crate -> refers to our local modules (crates?) we've made
 // All crates must be registered inside Cargo.toml
@@ -35,9 +36,15 @@ impl Processor {
         // Use match to figure out which processing function to call (currently trivial,
         // since we don't have anything). msg! logs where we are going.
         match instruction {
+            // tag = 0, we run the InitEscrow processing function
             EscrowInstruction::InitEscrow { amount } => {
                 msg!("Instruction: InitEscrow");
                 Self::process_init_escrow(accounts, amount, program_id)
+            },
+            // tag = 1, we run the Exchange processing function 
+            EscrowInstruction::Exchange { amount } => {
+                msg!("Instruction: Exchange");
+                Self::process_exchange(accounts, amount, program_id)
             }
         }
     }
@@ -110,6 +117,7 @@ impl Processor {
         // NOTE First time we access the account data ([u8]). We deserialize/decode it with
         // Escrow::unpack_unchecked() from state.rs (soon to create), which will return
         // an actual Escrow type (defined in state.rs) we can work with.
+        // NOTE We're using 'mut' since we want to add data to this object
         let mut escrow_info = Escrow::unpack_unchecked(&escrow_account.data.borrow())?;
         if escrow_info.is_initialized() {
             return Err(ProgramError::AccountAlreadyInitialized);
@@ -118,6 +126,8 @@ impl Processor {
         // Now let's add the state serialization. We've already created the Escrow struct
         // instance (via unpack_unchecked) and checked that it is indeed uninitialized.
         // Time to populate the Escrow struct fields!
+        // NOTE This literally is the data we'll be double-checking for the actual transfer
+        // instruction (see Exchange below).
         escrow_info.is_initialized = true;
         escrow_info.initializer_pubkey = *initializer.key;
         escrow_info.temp_token_account_pubkey = *temp_token_account.key;
@@ -155,7 +165,7 @@ impl Processor {
         // NOTE The program getting called through a CPI must be included as an account
         // in the 2nd argument of invoke() and invoke_signed() functions.
         let token_program = next_account_info(account_info_iter)?;
-        // Create the instruction that the token_program would expect were we executing
+        // Create the instruction (CPI) that the token_program would expect were we executing
         // a normal call. The token program defines some helper functions inside its
         // instruction.rs that we can make use of (e.g., set_authority fn). 
         // set_authority() is a builder function to create such an instruction.
@@ -195,6 +205,204 @@ impl Processor {
                 // https://docs.rs/spl-token/2.0.4/src/spl_token/instruction.rs.html#538-550
             ], 
         )?;
+
+        Ok(())
+    }
+
+
+    fn process_exchange(
+        accounts: &[AccountInfo],
+        amount_expected_by_taker: u64,
+        program_id: &Pubkey,
+    ) -> ProgramResult {
+        msg!("Calling process_exchange function");
+        // Get an iterator from the accounts passed into the Exchange instruction
+        let account_info_iter = &mut accounts.iter();
+        /// IMPORTANT: This is Bob's Transaction. Alice has already created the Escrow,
+        /// so now Bob needs to send the correct amount of Y tokens to the Escrow,
+        /// then the Escrow will send him Alice's X tokens and Alice his Y tokens.
+        ///
+        ///
+        /// 0. `[signer]` The account of the person taking the trade (Bob. Alice is the Initializer)
+        /// 1. `[writable]` The taker's (Bob) token account for the token they send 
+        /// 2. `[writable]` The taker's token account for the token they will receive should the trade go through
+        /// 3. `[writable]` The PDA's temp token account to get tokens from and eventually close
+        /// 4. `[writable]` The initializer's main account to send their rent fees to
+        /// 5. `[writable]` The initializer's token account that will receive tokens
+        /// 6. `[writable]` The escrow account holding the escrow info
+        /// 7. `[]` The token program
+        /// 8. `[]` The PDA account
+        // Time to loop over the accounts and assign to variables
+        // 0. Let's grab the taker account information
+        let taker = next_account_info(account_info_iter)?;
+        // Check that taker (Bob) is signer via AccountInfo is_signer boolean field
+        if !taker.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        // 1. Grab taker's sending token account (Y token)
+        let takers_sending_token_account = next_account_info(account_info_iter)?;
+
+        // 2. Grab taker's receiving token account (X token) if trade is successful
+        let takers_receiving_token_account = next_account_info(account_info_iter)?;
+
+        // 3. Grab Alice's temp X token account that's currently owned by
+        // the Escrow Program's PDA
+        let pdas_temp_token_account = next_account_info(account_info_iter)?;
+        // Check that this temp account holds what taker (Bob) expects in X token
+        // Q: The 'amount' information is stored in the account's data I think...
+        // A: Yes, had the right idea. We're going to use TokenAccount from state.rs
+        // to help us unpack this account data to double-check amounts are accurate
+        let pdas_temp_token_account_info = TokenAccount::unpack(&pdas_temp_token_account.data.borrow())?;
+        // Find the PDA address by using array of seeds and program_id.
+        // NOTE We're going to use this pda when passing authority_pubkey in transfer ix
+        let (pda, bump_seed) = Pubkey::find_program_address(&[b"escrow"], program_id);
+        // Finally, check that temp X token account amount is equal to this process_exchange's
+        // amount_expected_by_taker value.
+        if amount_expected_by_taker != pdas_temp_token_account_info.amount {
+            // Q: What does .into() do?
+            return Err(EscrowError::ExpectedAmountMismatch.into());
+        }
+
+        // 4. Grab the initializer's main account information
+        let initializers_main_account = next_account_info(account_info_iter)?;
+
+        // 5. Grab initializer's Y token account that will receive Y tokens (Alice's Y token)
+        let initializers_token_to_receive_account = next_account_info(account_info_iter)?;
+
+        // 6. Grab the Escrow State Account that's holding all the escrow info
+        let escrow_account = next_account_info(account_info_iter)?;
+
+        // 6.1 Check that PDA's temp token account matches the same as the Escrow Account's
+        // temp_token_account key. First need to unpack escrow_account data
+        let escrow_info = Escrow::unpack(&escrow_account.data.borrow())?;
+        // NOTE Need to dereference the borrow using '*' to match struct Pubkey
+        if escrow_info.temp_token_account_pubkey != *pdas_temp_token_account.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // 6.2 Check whether Escrow Accounts data/info for initializer pubkey matches
+        // the initializers_main_account that was passed into accounts arg
+        // NOTE Need to dereference the borrow using '*' to match struct Pubkey
+        if escrow_info.initializer_pubkey != *initializers_main_account.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // 6.3 Check whether the accounts for tokens to receive match between the
+        // Escrow Account's data/info and the accounts arg. Basically checking
+        // whether they both point to Alice's Y token account address.
+        if escrow_info.initializer_token_to_receive_account_pubkey != *initializers_token_to_receive_account.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // 7. Grab the Token Program account
+        // NOTE Recall that even programs in Solana live inside an account, i.e., the program
+        // in its binary form (e.g., helloworld.so, spl_token.so, etc.) is actually going to
+        // be the data of some account. This is key!
+        let token_program = next_account_info(account_info_iter)?;
+
+        // Q: Check whether token_program account is the same as the program that initialized
+        // the temp X token account? (NOT the user space owner property, as that is the Escrow
+        // Program's PDA. Not sure if that's needed...)
+
+        // Time to transfer Y tokens from Bob's account to Alice's Y token account
+        // To do this, we're actually creating an Transfer Instruction.
+        // NOTE To perform the actual transfer we use spl_token::instruction::transfer built-in
+        // method, which is a CPI. We then will use invoke() to call this new instruction
+        // and pass in this instruction along with the accounts involved.
+        // NOTE This is using Signature Extension to make the token transfer to Alice's Y
+        // token account on Bob's behalf.
+        let transfer_to_initializer_ix = spl_token::instruction::transfer(
+            token_program.key,
+            takers_sending_token_account.key, // source (Bob's Y token account)
+            initializers_token_to_receive_account.key, // destination (Alice's Y token account)
+            taker.key, // authority_pubkey (Bob's main account since he's authorizing the trade)
+            &[&taker.key], // signers array
+            escrow_info.expected_amount, // This is the amount passed to InitEscrow, i.e., Alice's X token amount
+            // NOTE Or, in other words, the agreed upon amount Bob expects to receive in X tokens for
+            // his Y tokens he's going to transfer to Alice.
+        )?;
+        msg!("Calling the token program to transfer tokens to the escrow's initializer...");
+        invoke(
+            &transfer_to_initializer_ix, // CPI instruction
+            &[
+                takers_sending_token_account.clone(), // Bob's Y token account
+                initializers_token_to_receive_account.clone(), // Alice's Y token account
+                taker.clone(), // Bob's main account
+                token_program.clone(), // Token Program AccountInfo.
+                // NOTE The token program key (id) is the program id of this
+                // transfer_to_initializer_ix
+            ],
+        )?;
+
+
+        // 8. Time to transfer X tokens from temp X token account to Bob's main X token account
+        // NOTE The PDA has authority on the temp X token account
+        let pda_account = next_account_info(account_info_iter)?;
+
+        // Create another Transfer Instruction
+        let transfer_to_taker_ix = spl_token::instruction::transfer(
+            token_program.key,
+            pdas_temp_token_account.key, // source. Q: Why not from pda_account?
+            takers_receiving_token_account.key, // destination (Bob's X token account).
+            &pda, // authority_pubkey (retrieved from find_program_address() above)
+            &[&pda],  // signers array. Again, the PDA is the signer
+            pdas_temp_token_account_info.amount,// amount to transfer (inside PDA AccountInfo)
+        )?;
+        // Now time to invoke this instruction
+        // NOTE This uses invoke_signed to allow the PDA to sign something. Recall that
+        // a PDA is bumped off the Ed25519 elliptic curve. Hence, there is NO private key.
+        // Q: Can PDAs sign CPIs? No, but actually yes! The PDA isn't actually signing
+        // the CPI in cryptographic fashion. In addition to the two args, the invoke_signed()
+        // takes a third argument: the seeds that were used to create the PDA the CPI is
+        // supposed to be "signed" with. Technically, the find_program_address() fn adds
+        // the bump seed to make the PDA fall off the Ed25519 curve.
+        //
+        // NOTE When a program calls invoke_signed(), the runtime uses those seeds and the
+        // program id of the calling program to recreate the PDA. If the PDA matches one
+        // of the given accounts inside invoke_signed's arguments, that account's 'signed'
+        // property will be set to true. This means that no other program (smart contract)
+        // can fake this PDA because it is the runtime that sees which program is making the
+        // invoke_signed call. In our case, only the Escrow program will have the program id
+        // that will result in a PDA equal to one of the addresses in invoke_signed's
+        // 'accounts' argument.
+        //
+        // Read more at:
+        // https://paulx.dev/blog/2021/01/14/programming-on-solana-an-introduction/#processor-part-3-pdas-part-3
+        msg!("Calling the token program to transfer tokens to the taker from pda temp account...");
+        invoke_signed(
+            &transfer_to_taker_ix, // CPI instruction
+            &[
+                pdas_temp_token_account.clone(),
+                takers_receiving_token_account.clone(),
+                pda_account.clone(),
+                token_program.clone(),
+            ],
+            &[&[&b"escrow"[..], &[bump_seed]]], // seeds used to create the PDA
+        )?;
+
+
+        // 9. Need to tidy up and close the temp PDA account using invoke_signed fn
+        let close_pdas_temp_acc_ix = spl_token::instruction::close_account(
+            token_program.key,
+            pdas_temp_token_account.key,
+            initializers_main_account.key,
+            &pda,
+            &[&pda]
+        )?;
+        msg!("Calling the token program to close PDA's temp account...");
+        invoke_signed(
+            &close_pdas_temp_acc_ix,
+            &[
+                pdas_temp_token_account.clone(),
+                initializers_main_account.clone(),
+                pda_account.clone(),
+                token_program.clone(),
+            ],
+            &[&[&b"escrow"[..], &[bump_seed]]],
+        )?;
+
+
 
         Ok(())
     }
