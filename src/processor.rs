@@ -109,7 +109,11 @@ impl Processor {
         let rent = &Rent::from_account_info(next_account_info(account_info_iter)?)?;
 
         // NOTE Most times you want your accounts to be rent-exempt, because if
-        // balances go to zero, they DISAPPEAR!
+        // balances go to zero, they DISAPPEAR (i.e., purged from memory at runtime)!
+        // This is why we're checking whether escrow (state) account is exempt. 
+        // If we didn't do this check, and Alice were to pass in a non-rent-exempt account,
+        // the account balance might go to zero balance before Bob takes the trade.
+        // With the account gone, Alice would have no way to recover her tokens.
         if !rent.is_exempt(escrow_account.lamports(), escrow_account.data_len()) {
             return Err(EscrowError::NotRentExempt.into());
         }
@@ -352,6 +356,7 @@ impl Processor {
         // Now time to invoke this instruction
         // NOTE This uses invoke_signed to allow the PDA to sign something. Recall that
         // a PDA is bumped off the Ed25519 elliptic curve. Hence, there is NO private key.
+        // (And hence why we pass &pda instead of &pda.key I believe.)
         // Q: Can PDAs sign CPIs? No, but actually yes! The PDA isn't actually signing
         // the CPI in cryptographic fashion. In addition to the two args, the invoke_signed()
         // takes a third argument: the seeds that were used to create the PDA the CPI is
@@ -383,6 +388,15 @@ impl Processor {
 
 
         // 9. Need to tidy up and close the temp PDA account using invoke_signed fn
+        // NOTE Accounts are required to have a min balance to be rent exempt. 
+        // So, when we no longer need an account (ie close the account), we can recover
+        // the balance by transferring it to a different account.
+        // NOTE If an account has no balance left, it will be purged from memory by the
+        // runtime after the transaction (you can see this via the explorer on closed accts).
+        // NOTE Since the temp token account is owned by the Token Program, only the TP may
+        // decrease the balance. And because this action requires permission of the
+        // (user space) owner of the token account (i.e., PDA in this case), we use
+        // invoked_signed() fn again.
         let close_pdas_temp_acc_ix = spl_token::instruction::close_account(
             token_program.key,
             pdas_temp_token_account.key,
@@ -402,7 +416,25 @@ impl Processor {
             &[&[&b"escrow"[..], &[bump_seed]]],
         )?;
 
-
+        // 10. Time to close the Escrow (state) account to conclude this program
+        msg!("Closing the escrow account...");
+        // We can credit Alice's main account with remaining balance in escrow account
+        // NOTE You can credit her account even though Escrow Program isn't the owner
+        // of her (initializer's) account.
+        **initializers_main_account.lamports.borrow_mut() = initializers_main_account
+            .lamports()
+            .checked_add(escrow_account.lamports())
+            .ok_or(EscrowError::AmountOverflow)?; // Need to add this new error in error.rs
+        **escrow_account.lamports.borrow_mut() = 0;
+        *escrow_account.data.borrow_mut() = &mut []; // Set the 'data' field to empty slice
+        // NOTE Even though the account will be purged at runtime, this is not the final
+        // instruction in the transaction. Thus, a subsequent tx may read or even revive
+        // the data completely by making the account rent-exempt again. Depending on your
+        // program, forgetting to clear the data field can have dangerous consequences.
+        // NOTE When you are intentionally closing an account by setting its lamports to zero
+        // so it's removed from memory after the tx, make sure to either clear the 'data' field
+        // or leave the data in a state that would be OK to be recovered by a subsequent
+        // transaction.
 
         Ok(())
     }
